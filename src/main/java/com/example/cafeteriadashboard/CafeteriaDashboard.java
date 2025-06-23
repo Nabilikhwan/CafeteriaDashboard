@@ -4,24 +4,23 @@ import javax.swing.*;
 import javax.swing.Timer;
 import javax.swing.border.TitledBorder;
 import java.awt.*;
-import java.awt.event.ActionEvent;
-import java.awt.event.ActionListener;
 import java.util.*;
 import java.util.List;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.*;  // Add this import for atomic classes
+import java.util.concurrent.atomic.*;
 import java.util.concurrent.locks.*;
-import java.util.stream.Collectors;    // Add this import for Collectors
+import java.util.logging.Logger;
 import java.util.stream.IntStream;
 
 // Main Application Class
 public class CafeteriaDashboard extends JFrame {
+    private final CafeteriaSystem cafeteriaSystem;
 
     public CafeteriaDashboard() {
-        CafeteriaSystem cafeteriaSystem = new CafeteriaSystem();
+        cafeteriaSystem = new CafeteriaSystem();
         DashboardUI dashboardUI = new DashboardUI(cafeteriaSystem);
 
-        setTitle("Real-Time Cafeteria Management Dashboard");
+        setTitle("Real-Time Cafeteria Analytics Dashboard");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLayout(new BorderLayout());
 
@@ -33,10 +32,19 @@ public class CafeteriaDashboard extends JFrame {
 
         // Start the cafeteria system
         cafeteriaSystem.startSystem();
+
+        // Add window listener to handle system shutdown
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosing(java.awt.event.WindowEvent windowEvent) {
+                cafeteriaSystem.stopSystem();
+                dispose();
+            }
+        });
     }
 
-    public static void main(String[] args) {
-        SwingUtilities.invokeLater(() -> new CafeteriaDashboard());
+    public static void main() {
+        SwingUtilities.invokeLater(CafeteriaDashboard::new);
     }
 }
 
@@ -53,7 +61,7 @@ class CafeteriaSystem {
     public CafeteriaSystem() {
         orderQueue = new OrderQueue();
         inventoryManager = new InventoryManager();
-        kitchenStaff = new KitchenStaff(5, orderQueue, this); // Pass 'this' to KitchenStaff
+        kitchenStaff = new KitchenStaff(5, orderQueue); // Pass 'this' to KitchenStaff
         metricsCollector = new MetricsCollector();
         executorService = Executors.newCachedThreadPool();
         scheduledExecutor = Executors.newScheduledThreadPool(3);
@@ -73,6 +81,18 @@ class CafeteriaSystem {
         kitchenStaff.shutdown();
         executorService.shutdown();
         scheduledExecutor.shutdown();
+
+        try {
+            boolean executorTerminated = executorService.awaitTermination(2, TimeUnit.SECONDS);
+            boolean schedulerTerminated = scheduledExecutor.awaitTermination(2, TimeUnit.SECONDS);
+
+            if (!executorTerminated || !schedulerTerminated) {
+                Logger.getLogger(getClass().getName()).warning("Some tasks did not terminate");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Logger.getLogger(getClass().getName()).warning("System shutdown interrupted");
+        }
     }
 
     // Getters for UI access
@@ -84,19 +104,14 @@ class CafeteriaSystem {
 
     public boolean processOrderIngredients(String itemName) {
         InventoryManager inventory = getInventoryManager();
-        switch (itemName) {
-            case "Chicken Burger":
-                return inventory.consumeIngredient("Burger Buns", 1) &&
-                       inventory.consumeIngredient("Chicken Breast", 1);
-            case "Pizza":
-                return inventory.consumeIngredient("Pizza Dough", 1);
-            case "Pasta Dish":
-                return inventory.consumeIngredient("Pasta", 1);
-            case "Fresh Salad":
-                return inventory.consumeIngredient("Salad Mix", 1);
-            default:
-                return false;
-        }
+        return switch (itemName) {
+            case "Chicken Burger" -> inventory.consumeIngredient("Burger Buns", 1) &&
+                    inventory.consumeIngredient("Chicken Breast", 1);
+            case "Pizza" -> inventory.consumeIngredient("Pizza", 1);  // Changed from Pizza Dough
+            case "Pasta" -> inventory.consumeIngredient("Pasta", 1);  // Changed from Pasta Dish
+            case "Salad Mix" -> inventory.consumeIngredient("Salad Mix", 1);  // Changed from Fresh Salad
+            default -> false;
+        };
     }
 }
 
@@ -104,18 +119,17 @@ class CafeteriaSystem {
 class OrderQueue {
     private final BlockingQueue<Order> pendingOrders = new LinkedBlockingQueue<>();
     private final List<Order> completedOrders = Collections.synchronizedList(new ArrayList<>());
+    private final Set<Order> activeOrders = Collections.synchronizedSet(new HashSet<>());
     private final ReentrantLock queueLock = new ReentrantLock();
     private final Condition orderAvailable = queueLock.newCondition();
     private final AtomicInteger orderIdCounter = new AtomicInteger(1);
-
-    private Order activeOrder; // Add this field to track which order is being processed
 
     public void addOrder(Order order) {
         queueLock.lock();
         try {
             order.setId(orderIdCounter.getAndIncrement());
             order.setOrderTime(System.currentTimeMillis());
-            pendingOrders.add(order);  // Changed from offer() to add()
+            pendingOrders.add(order);
             orderAvailable.signalAll();
         } finally {
             queueLock.unlock();
@@ -125,12 +139,21 @@ class OrderQueue {
     public Order takeOrder() throws InterruptedException {
         queueLock.lock();
         try {
-            while (pendingOrders.isEmpty() || activeOrder != null) {
+            while (pendingOrders.isEmpty()) {
                 orderAvailable.await();
             }
-            // Get the next order but keep it in pending orders
-            activeOrder = pendingOrders.peek();
-            return activeOrder;
+
+            // Take the first order that isn't already being processed
+            for (Order order : pendingOrders) {
+                if (!activeOrders.contains(order)) {
+                    activeOrders.add(order);  // Mark as being processed
+                    return order;  // Return this order to the worker
+                }
+            }
+
+            // If all orders are being processed, wait
+            orderAvailable.await();
+            return null;
         } finally {
             queueLock.unlock();
         }
@@ -139,7 +162,7 @@ class OrderQueue {
     public void completeOrder(Order order) {
         queueLock.lock();
         try {
-            // Ensure order stays in pending for at least 2 seconds
+            // Ensure minimum processing time of 2 seconds
             long timeInPending = System.currentTimeMillis() - order.getOrderTime();
             if (timeInPending < 2000) {
                 try {
@@ -149,20 +172,15 @@ class OrderQueue {
                 }
             }
 
-            // Remove from pending and add to completed only if it's the active order
-            if (order.equals(activeOrder) && pendingOrders.remove(order)) {
+            // Remove from both collections
+            if (activeOrders.remove(order) && pendingOrders.remove(order)) {
                 order.setCompletionTime(System.currentTimeMillis());
                 completedOrders.add(order);
-                activeOrder = null;  // Clear the active order
-                orderAvailable.signalAll();  // Signal that a new order can be processed
+                orderAvailable.signalAll(); // Signal that an order was completed
             }
         } finally {
             queueLock.unlock();
         }
-    }
-
-    public int getPendingOrdersCount() {
-        return pendingOrders.size();
     }
 
     public List<Order> getCompletedOrders() {
@@ -185,16 +203,13 @@ class OrderQueue {
 class KitchenStaff {
     private final List<KitchenWorker> workers;
     private final ExecutorService workerPool;
-    private final OrderQueue orderQueue;
-    private volatile boolean shutdown = false;
 
-    public KitchenStaff(int workerCount, OrderQueue orderQueue, CafeteriaSystem cafeteriaSystem) {
-        this.orderQueue = orderQueue;
+    public KitchenStaff(int workerCount, OrderQueue orderQueue) {
         this.workers = new ArrayList<>();
         this.workerPool = Executors.newFixedThreadPool(workerCount);
 
         for (int i = 0; i < workerCount; i++) {
-            workers.add(new KitchenWorker(i + 1, orderQueue, cafeteriaSystem));
+            workers.add(new KitchenWorker(i + 1, orderQueue));
         }
     }
 
@@ -205,51 +220,50 @@ class KitchenStaff {
     }
 
     public void shutdown() {
-        shutdown = true;
         workerPool.shutdownNow();
     }
 
     public List<KitchenWorker> getWorkers() {
         return workers;
     }
-
-    public boolean isShutdown() {
-        return shutdown;
-    }
 }
 
 // Kitchen Worker implementing Runnable
 class KitchenWorker implements Runnable {
+    private static final Logger LOGGER = Logger.getLogger(KitchenWorker.class.getName());
     private final int workerId;
     private final OrderQueue orderQueue;
-    private final CafeteriaSystem cafeteriaSystem;
     private volatile String currentTask = "Idle";
     private volatile boolean busy = false;
     private Order currentOrder;
 
-    public KitchenWorker(int workerId, OrderQueue orderQueue, CafeteriaSystem cafeteriaSystem) {
+    public KitchenWorker(int workerId, OrderQueue orderQueue) {
         this.workerId = workerId;
         this.orderQueue = orderQueue;
-        this.cafeteriaSystem = cafeteriaSystem;
     }
 
     @Override
     public void run() {
-        while (!Thread.currentThread().isInterrupted()) {
-            try {
-                currentOrder = null;
-                busy = false;
-                currentTask = "Waiting for orders";
+        try {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    currentOrder = null;
+                    busy = false;
+                    currentTask = "Waiting for orders";
 
-                Order order = orderQueue.takeOrder();
-                if (order != null) {  // Only process if we got an order
-                    currentOrder = order;
-                    processOrder(order);
+                    Order order = orderQueue.takeOrder();
+                    if (order != null) {
+                        currentOrder = order;
+                        processOrder(order);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
             }
+        } catch (Exception e) {
+            LOGGER.severe("Worker " + workerId + " encountered an error: " + e.getMessage());
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -266,10 +280,10 @@ class KitchenWorker implements Runnable {
                 case "Pizza":
                     simulatePizzaPreparation(order);
                     break;
-                case "Pasta Dish":
+                case "Pasta":            // Changed from Pasta Dish
                     simulatePastaPreparation(order);
                     break;
-                case "Fresh Salad":
+                case "Salad Mix":        // Changed from Fresh Salad
                     simulateSaladPreparation(order);
                     break;
                 default:
@@ -338,7 +352,7 @@ class InventoryManager {
         inventory.clear();
         inventory.put("Burger Buns", 20);
         inventory.put("Chicken Breast", 20);
-        inventory.put("Pizza Dough", 20);
+        inventory.put("Pizza", 20);      // Changed from Pizza Dough
         inventory.put("Pasta", 20);
         inventory.put("Salad Mix", 20);
     }
@@ -352,15 +366,6 @@ class InventoryManager {
                 return true;
             }
             return false;
-        } finally {
-            writeLock.unlock();
-        }
-    }
-
-    public void restockIngredient(String ingredient, int quantity) {
-        writeLock.lock();
-        try {
-            inventory.put(ingredient, inventory.getOrDefault(ingredient, 0) + quantity);
         } finally {
             writeLock.unlock();
         }
@@ -381,7 +386,7 @@ class InventoryManager {
         try {
             inventory.put("Burger Buns", 20);
             inventory.put("Chicken Breast", 20);
-            inventory.put("Pizza Dough", 20);
+            inventory.put("Pizza", 20);   // Changed from Pizza Dough
             inventory.put("Pasta", 20);
             inventory.put("Salad Mix", 20);
         } finally {
@@ -428,15 +433,6 @@ class MetricsCollector {
         totalOrders.incrementAndGet();
     }
 
-    // Parallel processing for metrics calculation
-    public Map<String, Double> calculateDetailedMetrics() {
-        return recentProcessingTimes.parallelStream()
-                .collect(Collectors.groupingBy(  // Use fully qualified name
-                        time -> time < 5000 ? "Fast" : time < 10000 ? "Medium" : "Slow",
-                        Collectors.averagingLong(Long::longValue)  // Use fully qualified name
-                ));
-    }
-
     // Getters
     public int getTotalOrders() { return totalOrders.get(); }
     public int getCompletedOrders() { return completedOrders.get(); }
@@ -446,89 +442,30 @@ class MetricsCollector {
 // Data Classes
 class Order {
     private int id;
-    private String itemName;
-    private int cookingTime;
-    private int complexity;
+    private final String itemName;
     private long orderTime;
     private long completionTime;
-    private String customerName;
 
-    public Order(String itemName, int cookingTime, int complexity, String customerName) {
+    public Order(String itemName, int cookingTime, int complexity) {
         this.itemName = itemName;
-        this.cookingTime = cookingTime;
-        this.complexity = complexity;
-        this.customerName = customerName;
     }
 
-    // Getters and Setters
+    // Remove unused getters
     public int getId() { return id; }
     public void setId(int id) { this.id = id; }
     public String getItemName() { return itemName; }
-    public int getCookingTime() { return cookingTime; }
-    public int getComplexity() { return complexity; }
     public long getOrderTime() { return orderTime; }
     public void setOrderTime(long orderTime) { this.orderTime = orderTime; }
     public long getCompletionTime() { return completionTime; }
     public void setCompletionTime(long completionTime) { this.completionTime = completionTime; }
-    public String getCustomerName() { return customerName; }
 
     @Override
     public String toString() {
-        return String.format("Order #%d: %s for %s", id, itemName, customerName);
+        return String.format("Order #%d: %s", id, itemName);
     }
 }
 
 // Background Tasks (Runnable implementations)
-class OrderGeneratorTask implements Runnable {
-    private final OrderQueue orderQueue;
-    private final Random random = new Random();
-    private final String[] menuItems = {
-            "Burger", "Pizza", "Pasta", "Salad", "Sandwich", "Soup", "Steak", "Fish"
-    };
-    private final String[] customerNames = {
-            "Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry"
-    };
-
-    public OrderGeneratorTask(OrderQueue orderQueue) {
-        this.orderQueue = orderQueue;
-    }
-
-    @Override
-    public void run() {
-        while (!Thread.currentThread().isInterrupted()) {
-            try {
-                // Generate random order
-                String item = menuItems[random.nextInt(menuItems.length)];
-                String customer = customerNames[random.nextInt(customerNames.length)];
-                int cookingTime = 2000 + random.nextInt(6000); // 2-8 seconds
-                int complexity = 1 + random.nextInt(5);
-
-                Order order = new Order(item, cookingTime, complexity, customer);
-                orderQueue.addOrder(order);
-
-                // Wait between orders
-                Thread.sleep(3000 + random.nextInt(5000));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-    }
-}
-
-class InventoryRestockTask implements Runnable {
-    private final InventoryManager inventoryManager;
-
-    public InventoryRestockTask(InventoryManager inventoryManager) {
-        this.inventoryManager = inventoryManager;
-    }
-
-    @Override
-    public void run() {
-        inventoryManager.restockAll();
-    }
-}
-
 class MetricsUpdateTask implements Runnable {
     private final MetricsCollector metricsCollector;
     private final OrderQueue orderQueue;
@@ -554,8 +491,8 @@ class MetricsUpdateTask implements Runnable {
 
 // GUI Components
 class DashboardUI extends JPanel {
+    private static final Logger LOGGER = Logger.getLogger(DashboardUI.class.getName());
     private final CafeteriaSystem cafeteriaSystem;
-    private final Timer uiUpdateTimer;  // Use fully qualified name for Timer
 
     // UI Components
     private JLabel systemStatusLabel;
@@ -579,7 +516,8 @@ class DashboardUI extends JPanel {
         setupEventHandlers();
 
         // Update UI every second
-        uiUpdateTimer = new Timer(1000, e -> updateUI());
+        // Use fully qualified name for Timer
+        Timer uiUpdateTimer = new Timer(1000, _ -> updateUI());
         uiUpdateTimer.start();
     }
 
@@ -605,7 +543,7 @@ class DashboardUI extends JPanel {
         updateAvailableItems(); // Initial population of combo box
         addOrderButton = new JButton("Add Order");
 
-        restockButton = new JButton("Emergency Restock");
+        restockButton = new JButton("Restock");
         performanceTestButton = new JButton("Run Performance Test");
     }
 
@@ -667,9 +605,9 @@ class DashboardUI extends JPanel {
     }
 
     private void setupEventHandlers() {
-        addOrderButton.addActionListener(e -> addRandomOrder());
-        restockButton.addActionListener(e -> performEmergencyRestock());
-        performanceTestButton.addActionListener(e -> runPerformanceTest());
+        addOrderButton.addActionListener(_ -> addRandomOrder());
+        restockButton.addActionListener(_ -> performEmergencyRestock());
+        performanceTestButton.addActionListener(_ -> runPerformanceTest());
     }
 
     private void updateAvailableItems() {
@@ -685,14 +623,14 @@ class DashboardUI extends JPanel {
                             itemComboBox.addItem("Chicken Burger");
                         }
                         break;
-                    case "Pizza Dough":
+                    case "Pizza":         // Changed from Pizza Dough
                         itemComboBox.addItem("Pizza");
                         break;
                     case "Pasta":
-                        itemComboBox.addItem("Pasta Dish");
+                        itemComboBox.addItem("Pasta");  // Changed from Pasta Dish
                         break;
                     case "Salad Mix":
-                        itemComboBox.addItem("Fresh Salad");
+                        itemComboBox.addItem("Salad Mix");  // Changed from Fresh Salad
                         break;
                 }
             }
@@ -706,10 +644,7 @@ class DashboardUI extends JPanel {
             return;
         }
 
-        Random random = new Random();
-        String[] customers = {"Walk-in Customer", "VIP Guest", "Staff Member", "Delivery Order"};
-        String customer = customers[random.nextInt(customers.length)];
-
+        // Remove customer selection since we don't need it anymore
         int cookingTime = 0;
         int complexity = 0;
         boolean orderPlaced = false;
@@ -731,11 +666,11 @@ class DashboardUI extends JPanel {
                     complexity = 4;
                     orderPlaced = true;
                 } else {
-                    JOptionPane.showMessageDialog(this, "Not enough Pizza Dough!");
+                    JOptionPane.showMessageDialog(this, "Not enough Pizza!");  // Changed message
                 }
                 break;
-            case "Pasta Dish":
-                if (cafeteriaSystem.processOrderIngredients("Pasta Dish")) {
+            case "Pasta":                // Changed from Pasta Dish
+                if (cafeteriaSystem.processOrderIngredients("Pasta")) {
                     cookingTime = 3000;
                     complexity = 2;
                     orderPlaced = true;
@@ -743,8 +678,8 @@ class DashboardUI extends JPanel {
                     JOptionPane.showMessageDialog(this, "Not enough Pasta!");
                 }
                 break;
-            case "Fresh Salad":
-                if (cafeteriaSystem.processOrderIngredients("Fresh Salad")) {
+            case "Salad Mix":            // Changed from Fresh Salad
+                if (cafeteriaSystem.processOrderIngredients("Salad Mix")) {
                     cookingTime = 2000;
                     complexity = 1;
                     orderPlaced = true;
@@ -757,7 +692,7 @@ class DashboardUI extends JPanel {
         }
 
         if (orderPlaced) {
-            Order order = new Order(selectedItem, cookingTime, complexity, customer);
+            Order order = new Order(selectedItem, cookingTime, complexity);  // Empty string for customer
             cafeteriaSystem.getOrderQueue().addOrder(order);
             cafeteriaSystem.getMetricsCollector().recordNewOrder(); // This increments total orders
 
@@ -793,26 +728,27 @@ class DashboardUI extends JPanel {
     }
 
     private void performEmergencyRestock() {
-        // Run restock in background thread
-        SwingWorker<Void, Void> worker = new SwingWorker<Void, Void>() {
+        SwingWorker<Void, Void> worker = new SwingWorker<>() {
             @Override
-            protected Void doInBackground() throws Exception {
+            protected Void doInBackground() {
                 cafeteriaSystem.getInventoryManager().restockAll();
                 return null;
             }
 
             @Override
             protected void done() {
-                JOptionPane.showMessageDialog(DashboardUI.this, "Emergency restock completed!");
+                // Update the dropdown menu after restock
+                updateAvailableItems();
+                JOptionPane.showMessageDialog(DashboardUI.this, "Restock completed!");
             }
         };
         worker.execute();
     }
 
     private void runPerformanceTest() {
-        SwingWorker<String, Void> worker = new SwingWorker<String, Void>() {
+        SwingWorker<String, Void> worker = new SwingWorker<>() {
             @Override
-            protected String doInBackground() throws Exception {
+            protected String doInBackground() {
                 return performConcurrencyTest();
             }
 
@@ -822,8 +758,8 @@ class DashboardUI extends JPanel {
                     String results = get();
                     JOptionPane.showMessageDialog(DashboardUI.this,
                             "Performance Test Results:\n" + results);
-                } catch (Exception e) {
-                    e.printStackTrace();
+                } catch (Exception ex) {
+                    LOGGER.severe("Performance test failed: " + ex.getMessage());
                 }
             }
         };
@@ -902,9 +838,9 @@ class DashboardUI extends JPanel {
     }
 
     @Override  // Add this annotation
-    public void updateUI() {  // Make this public
-        super.updateUI();  // Add super call
-        if (systemStatusLabel != null) {  // Check for null since this might be called during initialization
+    public void updateUI() {
+        super.updateUI();
+        if (systemStatusLabel != null) {
             // Update system status
             systemStatusLabel.setText("System Status: " +
                     (cafeteriaSystem.isSystemRunning() ? "Running" : "Stopped"));
@@ -919,10 +855,9 @@ class DashboardUI extends JPanel {
 
                 Order currentOrder = worker.getCurrentOrder();
                 if (currentOrder != null) {
-                    status.append(String.format(" | Order #%d: %s for %s",
+                    status.append(String.format(" | Order #%d: %s",
                         currentOrder.getId(),
-                        currentOrder.getItemName(),
-                        currentOrder.getCustomerName()));
+                        currentOrder.getItemName()));
                 }
 
                 status.append(String.format(" | Status: %s", worker.getCurrentTask()));
