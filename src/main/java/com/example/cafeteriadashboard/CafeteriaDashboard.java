@@ -1,845 +1,975 @@
 package com.example.cafeteriadashboard;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.concurrent.*;
-import java.util.concurrent.locks.*;
-import java.util.concurrent.atomic.*;
-import java.util.stream.Collectors;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import javax.swing.*;
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Font;
-import java.awt.GridLayout;
+import javax.swing.Timer;
+import javax.swing.border.TitledBorder;
+import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
+import java.util.*;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;  // Add this import for atomic classes
+import java.util.concurrent.locks.*;
+import java.util.stream.Collectors;    // Add this import for Collectors
+import java.util.stream.IntStream;
 
-// ============== DATA MODELS ==============
+// Main Application Class
+public class CafeteriaDashboard extends JFrame {
 
-class FoodItem {
-    private final String name;
-    private final AtomicInteger stock;
-    private final AtomicInteger sales;
-    private final double price;
-    private final AtomicLong lastUpdated;
+    public CafeteriaDashboard() {
+        CafeteriaSystem cafeteriaSystem = new CafeteriaSystem();
+        DashboardUI dashboardUI = new DashboardUI(cafeteriaSystem);
 
-    public FoodItem(String name, int initialStock, double price) {
-        this.name = name;
-        this.stock = new AtomicInteger(initialStock);
-        this.sales = new AtomicInteger(0);
-        this.price = price;
-        this.lastUpdated = new AtomicLong(System.currentTimeMillis());
+        setTitle("Real-Time Cafeteria Management Dashboard");
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setLayout(new BorderLayout());
+
+        add(dashboardUI, BorderLayout.CENTER);
+
+        pack();
+        setLocationRelativeTo(null);
+        setVisible(true);
+
+        // Start the cafeteria system
+        cafeteriaSystem.startSystem();
     }
 
-    public String getName() { return name; }
-    public int getStock() { return stock.get(); }
-    public int getSales() { return sales.get(); }
-    public double getPrice() { return price; }
-    public long getLastUpdated() { return lastUpdated.get(); }
-
-    public boolean decreaseStock(int amount) {
-        int current;
-        do {
-            current = stock.get();
-            if (current < amount) return false;
-        } while (!stock.compareAndSet(current, current - amount));
-
-        sales.addAndGet(amount);
-        lastUpdated.set(System.currentTimeMillis());
-        return true;
-    }
-
-    public void addStock(int amount) {
-        stock.addAndGet(amount);
-        lastUpdated.set(System.currentTimeMillis());
-    }
-
-    @Override
-    public String toString() {
-        return String.format("%-15s | Stock: %3d | Sales: %3d | $%.2f",
-                name, stock.get(), sales.get(), price);
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> new CafeteriaDashboard());
     }
 }
 
-class Sale {
-    private final String itemName;
-    private final int quantity;
-    private final double totalAmount;
-    private final LocalDateTime timestamp;
-    private final String outlet;
+// Core System Classes
+class CafeteriaSystem {
+    private final OrderQueue orderQueue;
+    private final KitchenStaff kitchenStaff;
+    private final InventoryManager inventoryManager;
+    private final MetricsCollector metricsCollector;
+    private final ExecutorService executorService;
+    private final ScheduledExecutorService scheduledExecutor;
+    private volatile boolean systemRunning = false;
 
-    public Sale(String itemName, int quantity, double price, String outlet) {
-        this.itemName = itemName;
-        this.quantity = quantity;
-        this.totalAmount = quantity * price;
-        this.timestamp = LocalDateTime.now();
-        this.outlet = outlet;
+    public CafeteriaSystem() {
+        orderQueue = new OrderQueue();
+        inventoryManager = new InventoryManager();
+        kitchenStaff = new KitchenStaff(5, orderQueue, this); // Pass 'this' to KitchenStaff
+        metricsCollector = new MetricsCollector();
+        executorService = Executors.newCachedThreadPool();
+        scheduledExecutor = Executors.newScheduledThreadPool(3);
+    }
+
+    public void startSystem() {
+        systemRunning = true;
+        kitchenStaff.startWorkers();
+
+        // Only keep metrics update task, remove order generator
+        scheduledExecutor.scheduleAtFixedRate(
+                new MetricsUpdateTask(metricsCollector, orderQueue), 0, 2, TimeUnit.SECONDS);
+    }
+
+    public void stopSystem() {
+        systemRunning = false;
+        kitchenStaff.shutdown();
+        executorService.shutdown();
+        scheduledExecutor.shutdown();
+    }
+
+    // Getters for UI access
+    public OrderQueue getOrderQueue() { return orderQueue; }
+    public KitchenStaff getKitchenStaff() { return kitchenStaff; }
+    public InventoryManager getInventoryManager() { return inventoryManager; }
+    public MetricsCollector getMetricsCollector() { return metricsCollector; }
+    public boolean isSystemRunning() { return systemRunning; }
+
+    public boolean processOrderIngredients(String itemName) {
+        InventoryManager inventory = getInventoryManager();
+        switch (itemName) {
+            case "Chicken Burger":
+                return inventory.consumeIngredient("Burger Buns", 1) &&
+                       inventory.consumeIngredient("Chicken Breast", 1);
+            case "Pizza":
+                return inventory.consumeIngredient("Pizza Dough", 1);
+            case "Pasta Dish":
+                return inventory.consumeIngredient("Pasta", 1);
+            case "Fresh Salad":
+                return inventory.consumeIngredient("Salad Mix", 1);
+            default:
+                return false;
+        }
+    }
+}
+
+// Order Management with Thread-Safe Queue
+class OrderQueue {
+    private final BlockingQueue<Order> pendingOrders = new LinkedBlockingQueue<>();
+    private final List<Order> completedOrders = Collections.synchronizedList(new ArrayList<>());
+    private final ReentrantLock queueLock = new ReentrantLock();
+    private final Condition orderAvailable = queueLock.newCondition();
+    private final AtomicInteger orderIdCounter = new AtomicInteger(1);
+
+    private Order activeOrder; // Add this field to track which order is being processed
+
+    public void addOrder(Order order) {
+        queueLock.lock();
+        try {
+            order.setId(orderIdCounter.getAndIncrement());
+            order.setOrderTime(System.currentTimeMillis());
+            pendingOrders.add(order);  // Changed from offer() to add()
+            orderAvailable.signalAll();
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
+    public Order takeOrder() throws InterruptedException {
+        queueLock.lock();
+        try {
+            while (pendingOrders.isEmpty() || activeOrder != null) {
+                orderAvailable.await();
+            }
+            // Get the next order but keep it in pending orders
+            activeOrder = pendingOrders.peek();
+            return activeOrder;
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
+    public void completeOrder(Order order) {
+        queueLock.lock();
+        try {
+            // Ensure order stays in pending for at least 2 seconds
+            long timeInPending = System.currentTimeMillis() - order.getOrderTime();
+            if (timeInPending < 2000) {
+                try {
+                    Thread.sleep(2000 - timeInPending);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            // Remove from pending and add to completed only if it's the active order
+            if (order.equals(activeOrder) && pendingOrders.remove(order)) {
+                order.setCompletionTime(System.currentTimeMillis());
+                completedOrders.add(order);
+                activeOrder = null;  // Clear the active order
+                orderAvailable.signalAll();  // Signal that a new order can be processed
+            }
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
+    public int getPendingOrdersCount() {
+        return pendingOrders.size();
+    }
+
+    public List<Order> getCompletedOrders() {
+        synchronized(completedOrders) {
+            return new ArrayList<>(completedOrders);
+        }
+    }
+
+    public List<Order> getPendingOrders() {
+        queueLock.lock();
+        try {
+            return new ArrayList<>(pendingOrders);
+        } finally {
+            queueLock.unlock();
+        }
+    }
+}
+
+// Kitchen Staff with Worker Threads
+class KitchenStaff {
+    private final List<KitchenWorker> workers;
+    private final ExecutorService workerPool;
+    private final OrderQueue orderQueue;
+    private volatile boolean shutdown = false;
+
+    public KitchenStaff(int workerCount, OrderQueue orderQueue, CafeteriaSystem cafeteriaSystem) {
+        this.orderQueue = orderQueue;
+        this.workers = new ArrayList<>();
+        this.workerPool = Executors.newFixedThreadPool(workerCount);
+
+        for (int i = 0; i < workerCount; i++) {
+            workers.add(new KitchenWorker(i + 1, orderQueue, cafeteriaSystem));
+        }
+    }
+
+    public void startWorkers() {
+        for (KitchenWorker worker : workers) {
+            workerPool.submit(worker);
+        }
+    }
+
+    public void shutdown() {
+        shutdown = true;
+        workerPool.shutdownNow();
+    }
+
+    public List<KitchenWorker> getWorkers() {
+        return workers;
+    }
+
+    public boolean isShutdown() {
+        return shutdown;
+    }
+}
+
+// Kitchen Worker implementing Runnable
+class KitchenWorker implements Runnable {
+    private final int workerId;
+    private final OrderQueue orderQueue;
+    private final CafeteriaSystem cafeteriaSystem;
+    private volatile String currentTask = "Idle";
+    private volatile boolean busy = false;
+    private Order currentOrder;
+
+    public KitchenWorker(int workerId, OrderQueue orderQueue, CafeteriaSystem cafeteriaSystem) {
+        this.workerId = workerId;
+        this.orderQueue = orderQueue;
+        this.cafeteriaSystem = cafeteriaSystem;
+    }
+
+    @Override
+    public void run() {
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                currentOrder = null;
+                busy = false;
+                currentTask = "Waiting for orders";
+
+                Order order = orderQueue.takeOrder();
+                if (order != null) {  // Only process if we got an order
+                    currentOrder = order;
+                    processOrder(order);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
+    private void processOrder(Order order) {
+        busy = true;
+        try {
+            currentTask = "Starting preparation of " + order.getItemName() + " (Order #" + order.getId() + ")";
+
+            // Process based on item type
+            switch (order.getItemName()) {
+                case "Chicken Burger":
+                    simulateBurgerPreparation(order);
+                    break;
+                case "Pizza":
+                    simulatePizzaPreparation(order);
+                    break;
+                case "Pasta Dish":
+                    simulatePastaPreparation(order);
+                    break;
+                case "Fresh Salad":
+                    simulateSaladPreparation(order);
+                    break;
+                default:
+                    currentTask = "Unknown order type";
+                    return;
+            }
+
+            // Complete the order and ensure it's visible in completed list
+            orderQueue.completeOrder(order);
+            currentTask = "Completed Order #" + order.getId() + " - " + order.getItemName();
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            busy = false;
+            currentOrder = null;
+        }
+    }
+
+    private void simulateBurgerPreparation(Order order) throws InterruptedException {
+        currentTask = "Grilling chicken for Order #" + order.getId();
+        Thread.sleep(2000);
+        currentTask = "Assembling burger for Order #" + order.getId();
+        Thread.sleep(2000);
+    }
+
+    private void simulatePizzaPreparation(Order order) throws InterruptedException {
+        currentTask = "Rolling pizza dough for Order #" + order.getId();
+        Thread.sleep(2000);
+        currentTask = "Adding toppings for Order #" + order.getId();
+        Thread.sleep(1500);
+        currentTask = "Baking pizza for Order #" + order.getId();
+        Thread.sleep(1500);
+    }
+
+    private void simulatePastaPreparation(Order order) throws InterruptedException {
+        currentTask = "Boiling pasta for Order #" + order.getId();
+        Thread.sleep(1500);
+        currentTask = "Preparing sauce for Order #" + order.getId();
+        Thread.sleep(1500);
+    }
+
+    private void simulateSaladPreparation(Order order) throws InterruptedException {
+        currentTask = "Washing vegetables for Order #" + order.getId();
+        Thread.sleep(1000);
+        currentTask = "Assembling salad for Order #" + order.getId();
+        Thread.sleep(1000);
     }
 
     // Getters
-    public String getItemName() { return itemName; }
-    public int getQuantity() { return quantity; }
-    public double getTotalAmount() { return totalAmount; }
-    public LocalDateTime getTimestamp() { return timestamp; }
-    public String getOutlet() { return outlet; }
+    public int getWorkerId() { return workerId; }
+    public String getCurrentTask() { return currentTask; }
+    public boolean isBusy() { return busy; }
+    public Order getCurrentOrder() { return currentOrder; }
 }
 
-// ============== THREAD SYNCHRONIZATION INTERFACES ==============
+// Inventory Management with Synchronization
+class InventoryManager {
+    private final Map<String, Integer> inventory = new ConcurrentHashMap<>();
+    private final ReadWriteLock inventoryLock = new ReentrantReadWriteLock();
+    private final Lock readLock = inventoryLock.readLock();
+    private final Lock writeLock = inventoryLock.writeLock();
 
-interface CafeteriaLock {
-    void lock();
-    void unlock();
-    boolean tryLock();
-    boolean tryLock(long time, TimeUnit unit) throws InterruptedException;
-}
+    public InventoryManager() {
+        // Initialize with static values
+        inventory.clear();
+        inventory.put("Burger Buns", 20);
+        inventory.put("Chicken Breast", 20);
+        inventory.put("Pizza Dough", 20);
+        inventory.put("Pasta", 20);
+        inventory.put("Salad Mix", 20);
+    }
 
-class CustomReentrantLock implements CafeteriaLock {
-    private final ReentrantLock lock = new ReentrantLock();
+    public boolean consumeIngredient(String ingredient, int quantity) {
+        writeLock.lock();
+        try {
+            int current = inventory.getOrDefault(ingredient, 0);
+            if (current >= quantity) {
+                inventory.put(ingredient, current - quantity);
+                return true;
+            }
+            return false;
+        } finally {
+            writeLock.unlock();
+        }
+    }
 
-    @Override
-    public void lock() { lock.lock(); }
+    public void restockIngredient(String ingredient, int quantity) {
+        writeLock.lock();
+        try {
+            inventory.put(ingredient, inventory.getOrDefault(ingredient, 0) + quantity);
+        } finally {
+            writeLock.unlock();
+        }
+    }
 
-    @Override
-    public void unlock() { lock.unlock(); }
+    public Map<String, Integer> getInventorySnapshot() {
+        readLock.lock();
+        try {
+            return new HashMap<>(inventory);
+        } finally {
+            readLock.unlock();
+        }
+    }
 
-    @Override
-    public boolean tryLock() { return lock.tryLock(); }
-
-    @Override
-    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
-        return lock.tryLock(time, unit);
+    // Remove or modify restockAll to use fixed amounts
+    public void restockAll() {
+        writeLock.lock();
+        try {
+            inventory.put("Burger Buns", 20);
+            inventory.put("Chicken Breast", 20);
+            inventory.put("Pizza Dough", 20);
+            inventory.put("Pasta", 20);
+            inventory.put("Salad Mix", 20);
+        } finally {
+            writeLock.unlock();
+        }
     }
 }
 
-// ============== RUNNABLE IMPLEMENTATIONS ==============
+// Metrics Collection with Concurrent Processing
+class MetricsCollector {
+    private final AtomicInteger totalOrders = new AtomicInteger(0);
+    private final AtomicInteger completedOrders = new AtomicInteger(0);
+    private final AtomicLong totalProcessingTime = new AtomicLong(0);
+    private final ConcurrentLinkedQueue<Long> recentProcessingTimes = new ConcurrentLinkedQueue<>();
 
-class InventoryMonitor implements Runnable {
-    private final ConcurrentHashMap<String, FoodItem> inventory;
-    private final BlockingQueue<String> alerts;
-    private final int lowStockThreshold;
-    private volatile boolean running = true;
-    private final CafeteriaLock lock;
+    private final long startTime = System.currentTimeMillis();
 
-    public InventoryMonitor(ConcurrentHashMap<String, FoodItem> inventory,
-                            BlockingQueue<String> alerts,
-                            int lowStockThreshold,
-                            CafeteriaLock lock) {
-        this.inventory = inventory;
-        this.alerts = alerts;
-        this.lowStockThreshold = lowStockThreshold;
-        this.lock = lock;
+    public double getThroughput() {
+        double runningTimeMinutes = (long) ((System.currentTimeMillis() - startTime) / 1000.0 / 60.0);
+        return runningTimeMinutes > 0 ? completedOrders.get() / runningTimeMinutes : 0;
     }
 
-    @Override
-    public void run() {
-        while (running && !Thread.currentThread().isInterrupted()) {
-            try {
-                lock.lock();
-                try {
-                    for (FoodItem item : inventory.values()) {
-                        if (item.getStock() <= lowStockThreshold) {
-                            String alert = String.format("LOW STOCK ALERT: %s has only %d items left!",
-                                    item.getName(), item.getStock());
-                            alerts.offer(alert);
-                        }
-                    }
-                } finally {
-                    lock.unlock();
-                }
+    public double getAverageProcessingTime() {
+        int completed = completedOrders.get();
+        if (completed == 0) return 0;
+        return totalProcessingTime.get() / (double) completed;
+    }
 
-                Thread.sleep(2000); // Check every 2 seconds
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+    public void recordOrderCompletion(Order order) {
+        if (order != null && order.getCompletionTime() > 0) {
+            completedOrders.incrementAndGet();
+            long processingTime = order.getCompletionTime() - order.getOrderTime();
+            totalProcessingTime.addAndGet(processingTime);
+            recentProcessingTimes.offer(processingTime);
+
+            // Keep only last 50 processing times
+            while (recentProcessingTimes.size() > 50) {
+                recentProcessingTimes.poll();
             }
         }
     }
 
-    public void stop() {
-        running = false;
-    }
-}
-
-class SalesSimulator implements Runnable {
-    private final ConcurrentHashMap<String, FoodItem> inventory;
-    private final BlockingQueue<Sale> salesQueue;
-    private final String outletName;
-    private final Random random = new Random();
-    private volatile boolean running = true;
-    private final CafeteriaLock lock;
-
-    public SalesSimulator(ConcurrentHashMap<String, FoodItem> inventory,
-                          BlockingQueue<Sale> salesQueue,
-                          String outletName,
-                          CafeteriaLock lock) {
-        this.inventory = inventory;
-        this.salesQueue = salesQueue;
-        this.outletName = outletName;
-        this.lock = lock;
+    public void recordNewOrder() {
+        totalOrders.incrementAndGet();
     }
 
-    @Override
-    public void run() {
-        while (running && !Thread.currentThread().isInterrupted()) {
-            try {
-                // Simulate random sales
-                if (lock.tryLock(500, TimeUnit.MILLISECONDS)) {
-                    try {
-                        List<String> items = new ArrayList<>(inventory.keySet());
-                        if (!items.isEmpty()) {
-                            String itemName = items.get(random.nextInt(items.size()));
-                            FoodItem item = inventory.get(itemName);
-                            int quantity = random.nextInt(3) + 1; // 1-3 items
-
-                            if (item.decreaseStock(quantity)) {
-                                Sale sale = new Sale(itemName, quantity, item.getPrice(), outletName);
-                                salesQueue.offer(sale);
-                            }
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                }
-
-                Thread.sleep(random.nextInt(3000) + 1000); // 1-4 seconds
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-    }
-
-    public void stop() {
-        running = false;
-    }
-}
-
-class StockReplenisher implements Runnable {
-    private final ConcurrentHashMap<String, FoodItem> inventory;
-    private final Random random = new Random();
-    private volatile boolean running = true;
-    private final CafeteriaLock lock;
-
-    public StockReplenisher(ConcurrentHashMap<String, FoodItem> inventory,
-                            CafeteriaLock lock) {
-        this.inventory = inventory;
-        this.lock = lock;
-    }
-
-    @Override
-    public void run() {
-        while (running && !Thread.currentThread().isInterrupted()) {
-            try {
-                if (lock.tryLock(1, TimeUnit.SECONDS)) {
-                    try {
-                        for (FoodItem item : inventory.values()) {
-                            if (item.getStock() < 10 && random.nextDouble() < 0.3) { // 30% chance to restock
-                                int restockAmount = random.nextInt(20) + 10; // 10-30 items
-                                item.addStock(restockAmount);
-                            }
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                }
-
-                Thread.sleep(5000); // Check every 5 seconds
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-    }
-
-    public void stop() {
-        running = false;
-    }
-}
-
-// ============== PARALLEL PROCESSING SYSTEM ==============
-
-class ParallelSalesAnalyzer {
-    private final ExecutorService executor;
-    private final ForkJoinPool forkJoinPool;
-
-    public ParallelSalesAnalyzer() {
-        this.executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
-        this.forkJoinPool = new ForkJoinPool();
-    }
-
-    // Parallel Reduction: Calculate total sales revenue
-    public CompletableFuture<Double> calculateTotalRevenue(List<Sale> sales) {
-        return CompletableFuture.supplyAsync(() -> {
-            return sales.parallelStream()
-                    .mapToDouble(Sale::getTotalAmount)
-                    .reduce(0.0, Double::sum);
-        }, executor);
-    }
-
-    // Parallel Decomposition: Analyze sales by outlet
-    public CompletableFuture<Map<String, Double>> analyzeSalesByOutlet(List<Sale> sales) {
-        return CompletableFuture.supplyAsync(() -> {
-            return sales.parallelStream()
-                    .collect(Collectors.groupingBy(
-                            Sale::getOutlet,
-                            Collectors.summingDouble(Sale::getTotalAmount)
-                    ));
-        }, executor);
-    }
-
-    // Parallel Merging: Combine multiple data sources
-    public CompletableFuture<Map<String, Integer>> mergeInventoryData(
-            List<CompletableFuture<Map<String, Integer>>> futures) {
-
-        CompletableFuture<Void> allOf = CompletableFuture.allOf(
-                futures.toArray(new CompletableFuture[0])
-        );
-
-        return allOf.thenApply(v -> {
-            Map<String, Integer> merged = new ConcurrentHashMap<>();
-            futures.forEach(future -> {
-                try {
-                    Map<String, Integer> data = future.get();
-                    data.forEach((key, value) ->
-                            merged.merge(key, value, Integer::sum)
-                    );
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            });
-            return merged;
-        });
-    }
-
-    // Pipeline Processing: Process sales data through multiple stages
-    public CompletableFuture<String> processSalesPipeline(List<Sale> sales) {
-        return CompletableFuture.supplyAsync(() -> sales) // Stage 1: Input
-                .thenApplyAsync(this::filterRecentSales)        // Stage 2: Filter
-                .thenApplyAsync(this::aggregateSales)           // Stage 3: Aggregate
-                .thenApplyAsync(this::formatResults);           // Stage 4: Format
-    }
-
-    private List<Sale> filterRecentSales(List<Sale> sales) {
-        LocalDateTime oneHourAgo = LocalDateTime.now().minusHours(1);
-        return sales.stream()
-                .filter(sale -> sale.getTimestamp().isAfter(oneHourAgo))
-                .collect(Collectors.toList());
-    }
-
-    private Map<String, Integer> aggregateSales(List<Sale> sales) {
-        return sales.stream()
-                .collect(Collectors.groupingBy(
-                        Sale::getItemName,
-                        Collectors.summingInt(Sale::getQuantity)
+    // Parallel processing for metrics calculation
+    public Map<String, Double> calculateDetailedMetrics() {
+        return recentProcessingTimes.parallelStream()
+                .collect(Collectors.groupingBy(  // Use fully qualified name
+                        time -> time < 5000 ? "Fast" : time < 10000 ? "Medium" : "Slow",
+                        Collectors.averagingLong(Long::longValue)  // Use fully qualified name
                 ));
     }
 
-    private String formatResults(Map<String, Integer> aggregated) {
-        StringBuilder sb = new StringBuilder("Recent Sales Summary:\n");
-        aggregated.entrySet().stream()
-                .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                .forEach(entry -> sb.append(String.format("  %s: %d units\n",
-                        entry.getKey(), entry.getValue())));
-        return sb.toString();
+    // Getters
+    public int getTotalOrders() { return totalOrders.get(); }
+    public int getCompletedOrders() { return completedOrders.get(); }
+    public int getPendingOrders() { return totalOrders.get() - completedOrders.get(); }
+}
+
+// Data Classes
+class Order {
+    private int id;
+    private String itemName;
+    private int cookingTime;
+    private int complexity;
+    private long orderTime;
+    private long completionTime;
+    private String customerName;
+
+    public Order(String itemName, int cookingTime, int complexity, String customerName) {
+        this.itemName = itemName;
+        this.cookingTime = cookingTime;
+        this.complexity = complexity;
+        this.customerName = customerName;
     }
 
-    public void shutdown() {
-        executor.shutdown();
-        forkJoinPool.shutdown();
+    // Getters and Setters
+    public int getId() { return id; }
+    public void setId(int id) { this.id = id; }
+    public String getItemName() { return itemName; }
+    public int getCookingTime() { return cookingTime; }
+    public int getComplexity() { return complexity; }
+    public long getOrderTime() { return orderTime; }
+    public void setOrderTime(long orderTime) { this.orderTime = orderTime; }
+    public long getCompletionTime() { return completionTime; }
+    public void setCompletionTime(long completionTime) { this.completionTime = completionTime; }
+    public String getCustomerName() { return customerName; }
+
+    @Override
+    public String toString() {
+        return String.format("Order #%d: %s for %s", id, itemName, customerName);
     }
 }
 
-// ============== LIVENESS PROBLEM DEMONSTRATION ==============
+// Background Tasks (Runnable implementations)
+class OrderGeneratorTask implements Runnable {
+    private final OrderQueue orderQueue;
+    private final Random random = new Random();
+    private final String[] menuItems = {
+            "Burger", "Pizza", "Pasta", "Salad", "Sandwich", "Soup", "Steak", "Fish"
+    };
+    private final String[] customerNames = {
+            "Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry"
+    };
 
-class LivenessDemo {
-    private final Object lock1 = new Object();
-    private final Object lock2 = new Object();
-    private volatile boolean deadlockResolved = false;
+    public OrderGeneratorTask(OrderQueue orderQueue) {
+        this.orderQueue = orderQueue;
+    }
 
-    // Potential deadlock scenario
-    public void demonstrateDeadlock() {
-        Thread t1 = new Thread(() -> {
-            synchronized (lock1) {
-                System.out.println("Thread 1: Holding lock1...");
-                try { Thread.sleep(100); } catch (InterruptedException e) {}
+    @Override
+    public void run() {
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                // Generate random order
+                String item = menuItems[random.nextInt(menuItems.length)];
+                String customer = customerNames[random.nextInt(customerNames.length)];
+                int cookingTime = 2000 + random.nextInt(6000); // 2-8 seconds
+                int complexity = 1 + random.nextInt(5);
 
-                System.out.println("Thread 1: Waiting for lock2...");
-                synchronized (lock2) {
-                    System.out.println("Thread 1: Acquired lock2!");
+                Order order = new Order(item, cookingTime, complexity, customer);
+                orderQueue.addOrder(order);
+
+                // Wait between orders
+                Thread.sleep(3000 + random.nextInt(5000));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+}
+
+class InventoryRestockTask implements Runnable {
+    private final InventoryManager inventoryManager;
+
+    public InventoryRestockTask(InventoryManager inventoryManager) {
+        this.inventoryManager = inventoryManager;
+    }
+
+    @Override
+    public void run() {
+        inventoryManager.restockAll();
+    }
+}
+
+class MetricsUpdateTask implements Runnable {
+    private final MetricsCollector metricsCollector;
+    private final OrderQueue orderQueue;
+    private final Set<Integer> processedOrders = new HashSet<>();
+
+    public MetricsUpdateTask(MetricsCollector metricsCollector, OrderQueue orderQueue) {
+        this.metricsCollector = metricsCollector;
+        this.orderQueue = orderQueue;
+    }
+
+    @Override
+    public void run() {
+        // Update metrics with completed orders
+        List<Order> completed = orderQueue.getCompletedOrders();
+        for (Order order : completed) {
+            if (!processedOrders.contains(order.getId())) {
+                metricsCollector.recordOrderCompletion(order);
+                processedOrders.add(order.getId());
+            }
+        }
+    }
+}
+
+// GUI Components
+class DashboardUI extends JPanel {
+    private final CafeteriaSystem cafeteriaSystem;
+    private final Timer uiUpdateTimer;  // Use fully qualified name for Timer
+
+    // UI Components
+    private JLabel systemStatusLabel;
+    private JList<String> workerStatusList;
+    private DefaultListModel<String> workerListModel;
+    private JList<Order> pendingOrdersList;
+    private DefaultListModel<Order> pendingOrdersModel;
+    private JList<Order> completedOrdersList;
+    private DefaultListModel<Order> completedOrdersModel;
+    private JTextArea inventoryArea;
+    private JLabel metricsLabel;
+    private JComboBox<String> itemComboBox;  // Add this field
+    private JButton addOrderButton;
+    private JButton restockButton;
+    private JButton performanceTestButton;
+
+    public DashboardUI(CafeteriaSystem cafeteriaSystem) {
+        this.cafeteriaSystem = cafeteriaSystem;
+        initializeComponents();
+        layoutComponents();
+        setupEventHandlers();
+
+        // Update UI every second
+        uiUpdateTimer = new Timer(1000, e -> updateUI());
+        uiUpdateTimer.start();
+    }
+
+    private void initializeComponents() {
+        systemStatusLabel = new JLabel("System Status: Starting...");
+
+        workerListModel = new DefaultListModel<>();
+        workerStatusList = new JList<>(workerListModel);
+
+        pendingOrdersModel = new DefaultListModel<>();
+        pendingOrdersList = new JList<>(pendingOrdersModel);
+
+        completedOrdersModel = new DefaultListModel<>();
+        completedOrdersList = new JList<>(completedOrdersModel);
+
+        inventoryArea = new JTextArea(10, 20);
+        inventoryArea.setEditable(false);
+
+        metricsLabel = new JLabel("<html>Metrics:<br/>Loading...</html>");
+
+        // Replace the addOrderButton initialization with these components
+        itemComboBox = new JComboBox<>();
+        updateAvailableItems(); // Initial population of combo box
+        addOrderButton = new JButton("Add Order");
+
+        restockButton = new JButton("Emergency Restock");
+        performanceTestButton = new JButton("Run Performance Test");
+    }
+
+    private void layoutComponents() {
+        setLayout(new BorderLayout());
+
+        // Top panel - System status
+        JPanel topPanel = new JPanel(new FlowLayout());
+        topPanel.add(systemStatusLabel);
+        topPanel.add(new JLabel("Select Item: "));  // Add label for dropdown
+        topPanel.add(itemComboBox);
+        topPanel.add(addOrderButton);
+        topPanel.add(restockButton);
+        topPanel.add(performanceTestButton);
+        add(topPanel, BorderLayout.NORTH);
+
+        // Main content
+        JPanel mainPanel = new JPanel(new GridLayout(2, 3, 5, 5));
+
+        // Workers panel
+        JPanel workersPanel = new JPanel(new BorderLayout());
+        workersPanel.setBorder(new TitledBorder("Kitchen Workers"));
+        workersPanel.add(new JScrollPane(workerStatusList), BorderLayout.CENTER);
+        mainPanel.add(workersPanel);
+
+        // Pending orders panel
+        JPanel pendingPanel = new JPanel(new BorderLayout());
+        pendingPanel.setBorder(new TitledBorder("Pending Orders"));
+        pendingPanel.add(new JScrollPane(pendingOrdersList), BorderLayout.CENTER);
+        mainPanel.add(pendingPanel);
+
+        // Completed orders panel
+        JPanel completedPanel = new JPanel(new BorderLayout());
+        completedPanel.setBorder(new TitledBorder("Completed Orders"));
+        completedPanel.add(new JScrollPane(completedOrdersList), BorderLayout.CENTER);
+        mainPanel.add(completedPanel);
+
+        // Inventory panel
+        JPanel inventoryPanel = new JPanel(new BorderLayout());
+        inventoryPanel.setBorder(new TitledBorder("Inventory Status"));
+        inventoryPanel.add(new JScrollPane(inventoryArea), BorderLayout.CENTER);
+        mainPanel.add(inventoryPanel);
+
+        // Metrics panel
+        JPanel metricsPanel = new JPanel(new BorderLayout());
+        metricsPanel.setBorder(new TitledBorder("Performance Metrics"));
+        metricsPanel.add(metricsLabel, BorderLayout.CENTER);
+        mainPanel.add(metricsPanel);
+
+        // Performance test results
+        JPanel performancePanel = new JPanel(new BorderLayout());
+        performancePanel.setBorder(new TitledBorder("Performance Test Results"));
+        JTextArea performanceArea = new JTextArea();
+        performanceArea.setEditable(false);
+        performancePanel.add(new JScrollPane(performanceArea), BorderLayout.CENTER);
+        mainPanel.add(performancePanel);
+
+        add(mainPanel, BorderLayout.CENTER);
+    }
+
+    private void setupEventHandlers() {
+        addOrderButton.addActionListener(e -> addRandomOrder());
+        restockButton.addActionListener(e -> performEmergencyRestock());
+        performanceTestButton.addActionListener(e -> runPerformanceTest());
+    }
+
+    private void updateAvailableItems() {
+        itemComboBox.removeAllItems();
+        Map<String, Integer> inventory = cafeteriaSystem.getInventoryManager().getInventorySnapshot();
+
+        // Only add items that have stock available
+        for (Map.Entry<String, Integer> entry : inventory.entrySet()) {
+            if (entry.getValue() > 0) {
+                switch (entry.getKey()) {
+                    case "Burger Buns":
+                        if (inventory.getOrDefault("Chicken Breast", 0) > 0) {
+                            itemComboBox.addItem("Chicken Burger");
+                        }
+                        break;
+                    case "Pizza Dough":
+                        itemComboBox.addItem("Pizza");
+                        break;
+                    case "Pasta":
+                        itemComboBox.addItem("Pasta Dish");
+                        break;
+                    case "Salad Mix":
+                        itemComboBox.addItem("Fresh Salad");
+                        break;
                 }
             }
-        }, "DeadlockThread1");
+        }
+    }
 
-        Thread t2 = new Thread(() -> {
-            synchronized (lock2) {
-                System.out.println("Thread 2: Holding lock2...");
-                try { Thread.sleep(100); } catch (InterruptedException e) {}
+    private void addRandomOrder() {
+        String selectedItem = (String) itemComboBox.getSelectedItem();
+        if (selectedItem == null) {
+            JOptionPane.showMessageDialog(this, "No items available to order!");
+            return;
+        }
 
-                System.out.println("Thread 2: Waiting for lock1...");
-                synchronized (lock1) {
-                    System.out.println("Thread 2: Acquired lock1!");
+        Random random = new Random();
+        String[] customers = {"Walk-in Customer", "VIP Guest", "Staff Member", "Delivery Order"};
+        String customer = customers[random.nextInt(customers.length)];
+
+        int cookingTime = 0;
+        int complexity = 0;
+        boolean orderPlaced = false;
+
+        // First check and consume ingredients
+        switch (selectedItem) {
+            case "Chicken Burger":
+                if (cafeteriaSystem.processOrderIngredients("Chicken Burger")) {
+                    cookingTime = 4000;
+                    complexity = 3;
+                    orderPlaced = true;
+                } else {
+                    JOptionPane.showMessageDialog(this, "Not enough ingredients for Chicken Burger!");
                 }
-            }
-        }, "DeadlockThread2");
+                break;
+            case "Pizza":
+                if (cafeteriaSystem.processOrderIngredients("Pizza")) {
+                    cookingTime = 5000;
+                    complexity = 4;
+                    orderPlaced = true;
+                } else {
+                    JOptionPane.showMessageDialog(this, "Not enough Pizza Dough!");
+                }
+                break;
+            case "Pasta Dish":
+                if (cafeteriaSystem.processOrderIngredients("Pasta Dish")) {
+                    cookingTime = 3000;
+                    complexity = 2;
+                    orderPlaced = true;
+                } else {
+                    JOptionPane.showMessageDialog(this, "Not enough Pasta!");
+                }
+                break;
+            case "Fresh Salad":
+                if (cafeteriaSystem.processOrderIngredients("Fresh Salad")) {
+                    cookingTime = 2000;
+                    complexity = 1;
+                    orderPlaced = true;
+                } else {
+                    JOptionPane.showMessageDialog(this, "Not enough Salad Mix!");
+                }
+                break;
+            default:
+                return;
+        }
 
-        System.out.println("=== Demonstrating Potential Deadlock ===");
-        t1.start();
-        t2.start();
+        if (orderPlaced) {
+            Order order = new Order(selectedItem, cookingTime, complexity, customer);
+            cafeteriaSystem.getOrderQueue().addOrder(order);
+            cafeteriaSystem.getMetricsCollector().recordNewOrder(); // This increments total orders
 
-        // Timeout mechanism to resolve deadlock
-        Timer timer = new Timer();
-        timer.schedule(new TimerTask() {
+            // Force immediate UI update
+            SwingUtilities.invokeLater(() -> {
+                // Update metrics immediately for new order
+                MetricsCollector metrics = cafeteriaSystem.getMetricsCollector();
+                String metricsText = String.format(
+                        "<html>Total Orders: %d<br/>" +
+                        "Completed: %d<br/>" +
+                        "Pending: %d<br/>" +
+                        "Avg Processing Time: %.1fms<br/>" +
+                        "Throughput: %.2f orders/min</html>",
+                        metrics.getTotalOrders(),
+                        metrics.getCompletedOrders(),
+                        metrics.getPendingOrders(),
+                        metrics.getAverageProcessingTime(),
+                        metrics.getThroughput()
+                );
+                metricsLabel.setText(metricsText);
+
+                // Update pending orders list
+                List<Order> pendingOrders = cafeteriaSystem.getOrderQueue().getPendingOrders();
+                pendingOrdersModel.clear();
+                for (Order pendingOrder : pendingOrders) {
+                    pendingOrdersModel.addElement(pendingOrder);
+                }
+
+                updateUI();
+                updateAvailableItems();
+            });
+        }
+    }
+
+    private void performEmergencyRestock() {
+        // Run restock in background thread
+        SwingWorker<Void, Void> worker = new SwingWorker<Void, Void>() {
             @Override
-            public void run() {
-                if (t1.isAlive() || t2.isAlive()) {
-                    System.out.println("DEADLOCK DETECTED! Interrupting threads...");
-                    t1.interrupt();
-                    t2.interrupt();
-                    deadlockResolved = true;
+            protected Void doInBackground() throws Exception {
+                cafeteriaSystem.getInventoryManager().restockAll();
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                JOptionPane.showMessageDialog(DashboardUI.this, "Emergency restock completed!");
+            }
+        };
+        worker.execute();
+    }
+
+    private void runPerformanceTest() {
+        SwingWorker<String, Void> worker = new SwingWorker<String, Void>() {
+            @Override
+            protected String doInBackground() throws Exception {
+                return performConcurrencyTest();
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    String results = get();
+                    JOptionPane.showMessageDialog(DashboardUI.this,
+                            "Performance Test Results:\n" + results);
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
             }
-        }, 2000);
-
-        try {
-            t1.join(3000);
-            t2.join(3000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-
-        timer.cancel();
-
-        if (deadlockResolved) {
-            System.out.println("Deadlock resolved by timeout mechanism");
-        } else {
-            System.out.println("No deadlock occurred - lucky timing!");
-        }
-    }
-}
-
-// ============== PERFORMANCE TESTING ==============
-
-class PerformanceTester {
-
-    public void testConcurrentPerformance(CafeteriaManagementSystem system) {
-        System.out.println("\n=== PERFORMANCE TESTING ===");
-
-        // Test 1: Single-threaded vs Multi-threaded sales processing
-        System.out.println("\n1. Sales Processing Performance:");
-        testSalesProcessing(system);
-
-        // Test 2: Lock contention
-        System.out.println("\n2. Lock Contention Test:");
-        testLockContention(system);
-
-        // Test 3: Memory usage
-        System.out.println("\n3. Memory Usage:");
-        testMemoryUsage();
+        };
+        worker.execute();
     }
 
-    private void testSalesProcessing(CafeteriaManagementSystem system) {
-        int numOperations = 1000;
+    private String performConcurrencyTest() {
+        StringBuilder results = new StringBuilder();
 
-        // Single-threaded test
-        long startTime = System.nanoTime();
-        for (int i = 0; i < numOperations; i++) {
-            // Simulate processing
-            system.getInventory().values().forEach(item -> item.getSales());
-        }
-        long singleThreadTime = System.nanoTime() - startTime;
-
-        // Multi-threaded test
-        startTime = System.nanoTime();
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        ExecutorService executor = Executors.newFixedThreadPool(4);
-
-        for (int i = 0; i < numOperations; i++) {
-            futures.add(CompletableFuture.runAsync(() -> {
-                system.getInventory().values().forEach(item -> item.getSales());
-            }, executor));
-        }
-
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        long multiThreadTime = System.nanoTime() - startTime;
-
-        executor.shutdown();
-
-        System.out.printf("  Single-threaded: %.2f ms\n", singleThreadTime / 1_000_000.0);
-        System.out.printf("  Multi-threaded:  %.2f ms\n", multiThreadTime / 1_000_000.0);
-        System.out.printf("  Speedup: %.2fx\n", (double) singleThreadTime / multiThreadTime);
-    }
-
-    private void testLockContention(CafeteriaManagementSystem system) {
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch endLatch = new CountDownLatch(10);
-        AtomicInteger successCount = new AtomicInteger(0);
+        // Test 1: Thread creation and joining
+        long startTime = System.currentTimeMillis();
+        List<Thread> testThreads = new ArrayList<>();
 
         for (int i = 0; i < 10; i++) {
-            new Thread(() -> {
+            Thread t = new Thread(() -> {
                 try {
-                    startLatch.await();
-                    if (system.getLock().tryLock(100, TimeUnit.MILLISECONDS)) {
-                        try {
-                            Thread.sleep(50); // Simulate work
-                            successCount.incrementAndGet();
-                        } finally {
-                            system.getLock().unlock();
-                        }
-                    }
+                    Thread.sleep(100);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                } finally {
-                    endLatch.countDown();
                 }
-            }).start();
+            });
+            testThreads.add(t);
+            t.start();
         }
 
-        startLatch.countDown();
-        try {
-            endLatch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-
-        System.out.printf("  Lock acquisition success rate: %d/10 (%.1f%%)\n",
-                successCount.get(), successCount.get() * 10.0);
-    }
-
-    private void testMemoryUsage() {
-        Runtime runtime = Runtime.getRuntime();
-        long beforeMemory = runtime.totalMemory() - runtime.freeMemory();
-
-        // Create many objects to test memory usage
-        List<Sale> sales = new ArrayList<>();
-        for (int i = 0; i < 10000; i++) {
-            sales.add(new Sale("TestItem", 1, 5.0, "TestOutlet"));
-        }
-
-        runtime.gc(); // Suggest garbage collection
-
-        long afterMemory = runtime.totalMemory() - runtime.freeMemory();
-        long memoryUsed = afterMemory - beforeMemory;
-
-        System.out.printf("  Memory used for 10,000 sales objects: %.2f MB\n",
-                memoryUsed / (1024.0 * 1024.0));
-
-        sales.clear(); // Clean up
-    }
-}
-
-// ============== MAIN SYSTEM ==============
-
-class CafeteriaManagementSystem {
-    private final ConcurrentHashMap<String, FoodItem> inventory;
-    private final BlockingQueue<Sale> salesQueue;
-    private final BlockingQueue<String> alertQueue;
-    private final List<Thread> workerThreads;
-    private final List<Runnable> workers;
-    private final CafeteriaLock mainLock;
-    private final ParallelSalesAnalyzer analyzer;
-    private final PerformanceTester performanceTester;
-
-    // For GUI
-    private JFrame frame;
-    private JTextArea inventoryArea;
-    private JTextArea salesArea;
-    private JTextArea alertArea;
-    private JTextArea analyticsArea;
-    private javax.swing.Timer guiUpdateTimer;
-
-    public CafeteriaManagementSystem() {
-        this.inventory = new ConcurrentHashMap<>();
-        this.salesQueue = new LinkedBlockingQueue<>();
-        this.alertQueue = new LinkedBlockingQueue<>();
-        this.workerThreads = new ArrayList<>();
-        this.workers = new ArrayList<>();
-        this.mainLock = new CustomReentrantLock();
-        this.analyzer = new ParallelSalesAnalyzer();
-        this.performanceTester = new PerformanceTester();
-
-        initializeInventory();
-        setupGUI();
-        startWorkerThreads();
-    }
-
-    private void initializeInventory() {
-        inventory.put("Burger", new FoodItem("Burger", 50, 8.99));
-        inventory.put("Pizza", new FoodItem("Pizza", 30, 12.50));
-        inventory.put("Sandwich", new FoodItem("Sandwich", 40, 6.75));
-        inventory.put("Salad", new FoodItem("Salad", 25, 7.99));
-        inventory.put("Coffee", new FoodItem("Coffee", 100, 3.50));
-        inventory.put("Soda", new FoodItem("Soda", 80, 2.25));
-        inventory.put("Pasta", new FoodItem("Pasta", 35, 9.99));
-        inventory.put("Soup", new FoodItem("Soup", 20, 5.50));
-    }
-
-    private void setupGUI() {
-        frame = new JFrame("Real-Time Cafeteria Dashboard");
-        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        frame.setLayout(new GridLayout(2, 2, 10, 10));
-        frame.setSize(1200, 800);
-
-        // Inventory Panel
-        JPanel inventoryPanel = new JPanel(new BorderLayout());
-        inventoryPanel.setBorder(BorderFactory.createTitledBorder("Live Inventory"));
-        inventoryArea = new JTextArea(10, 30);
-        inventoryArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        inventoryArea.setEditable(false);
-        inventoryPanel.add(new JScrollPane(inventoryArea), BorderLayout.CENTER);
-
-        // Sales Panel
-        JPanel salesPanel = new JPanel(new BorderLayout());
-        salesPanel.setBorder(BorderFactory.createTitledBorder("Recent Sales"));
-        salesArea = new JTextArea(10, 30);
-        salesArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        salesArea.setEditable(false);
-        salesPanel.add(new JScrollPane(salesArea), BorderLayout.CENTER);
-
-        // Alerts Panel
-        JPanel alertPanel = new JPanel(new BorderLayout());
-        alertPanel.setBorder(BorderFactory.createTitledBorder("System Alerts"));
-        alertArea = new JTextArea(10, 30);
-        alertArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        alertArea.setEditable(false);
-        alertArea.setBackground(new Color(255, 240, 240));
-        alertPanel.add(new JScrollPane(alertArea), BorderLayout.CENTER);
-
-        // Analytics Panel
-        JPanel analyticsPanel = new JPanel(new BorderLayout());
-        analyticsPanel.setBorder(BorderFactory.createTitledBorder("Analytics & Performance"));
-        analyticsArea = new JTextArea(10, 30);
-        analyticsArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        analyticsArea.setEditable(false);
-        analyticsPanel.add(new JScrollPane(analyticsArea), BorderLayout.CENTER);
-
-        // Control buttons
-        JPanel controlPanel = new JPanel();
-        JButton testButton = new JButton("Run Performance Test");
-        JButton deadlockButton = new JButton("Demo Liveness Issues");
-        JButton resetButton = new JButton("Reset System");
-
-        testButton.addActionListener(e -> {
-            new Thread(() -> performanceTester.testConcurrentPerformance(this)).start();
-        });
-
-        deadlockButton.addActionListener(e -> {
-            new Thread(() -> new LivenessDemo().demonstrateDeadlock()).start();
-        });
-
-        resetButton.addActionListener(e -> resetSystem());
-
-        controlPanel.add(testButton);
-        controlPanel.add(deadlockButton);
-        controlPanel.add(resetButton);
-        analyticsPanel.add(controlPanel, BorderLayout.SOUTH);
-
-        frame.add(inventoryPanel);
-        frame.add(salesPanel);
-        frame.add(alertPanel);
-        frame.add(analyticsPanel);
-
-        frame.setVisible(true);
-
-        // Create and start the GUI update timer
-        guiUpdateTimer = new javax.swing.Timer(1000, e -> updateGUI());
-        guiUpdateTimer.start();
-    }
-
-    private void startWorkerThreads() {
-        // Inventory monitor
-        InventoryMonitor inventoryMonitor = new InventoryMonitor(inventory, alertQueue, 5, mainLock);
-        workers.add(inventoryMonitor);
-        Thread inventoryThread = new Thread(inventoryMonitor, "InventoryMonitor");
-        workerThreads.add(inventoryThread);
-        inventoryThread.start();
-
-        // Sales simulators for different outlets
-        String[] outlets = {"Main Cafeteria", "Food Court", "Coffee Shop"};
-        for (String outlet : outlets) {
-            SalesSimulator simulator = new SalesSimulator(inventory, salesQueue, outlet, mainLock);
-            workers.add(simulator);
-            Thread salesThread = new Thread(simulator, "SalesSimulator-" + outlet);
-            workerThreads.add(salesThread);
-            salesThread.start();
-        }
-
-        // Stock replenisher
-        StockReplenisher replenisher = new StockReplenisher(inventory, mainLock);
-        workers.add(replenisher);
-        Thread replenishThread = new Thread(replenisher, "StockReplenisher");
-        workerThreads.add(replenishThread);
-        replenishThread.start();
-
-        System.out.println("All worker threads started successfully!");
-        System.out.println("Active threads: " + workerThreads.size());
-    }
-
-    private void updateGUI() {
-        // Update inventory display
-        StringBuilder inventoryText = new StringBuilder();
-        inventoryText.append("CURRENT INVENTORY STATUS\n");
-        inventoryText.append("=" .repeat(50)).append("\n");
-        inventory.values().forEach(item -> inventoryText.append(item).append("\n"));
-        SwingUtilities.invokeLater(() -> inventoryArea.setText(inventoryText.toString()));
-
-        // Update sales display
-        StringBuilder salesText = new StringBuilder();
-        salesText.append("RECENT SALES TRANSACTIONS\n");
-        salesText.append("=".repeat(50)).append("\n");
-        List<Sale> recentSales = new ArrayList<>();
-        salesQueue.drainTo(recentSales, 20); // Get up to 20 recent sales
-
-        for (Sale sale : recentSales) {
-            salesText.append(String.format("%s | %s | %dx %s | $%.2f\n",
-                    sale.getTimestamp().format(DateTimeFormatter.ofPattern("HH:mm:ss")),
-                    sale.getOutlet(),
-                    sale.getQuantity(),
-                    sale.getItemName(),
-                    sale.getTotalAmount()));
-        }
-        SwingUtilities.invokeLater(() -> salesArea.setText(salesText.toString()));
-
-        // Update alerts
-        StringBuilder alertText = new StringBuilder();
-        alertText.append("SYSTEM ALERTS\n");
-        alertText.append("=".repeat(30)).append("\n");
-        List<String> alerts = new ArrayList<>();
-        alertQueue.drainTo(alerts, 10);
-
-        for (String alert : alerts) {
-            alertText.append(LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")))
-                    .append(" - ").append(alert).append("\n");
-        }
-        SwingUtilities.invokeLater(() -> alertArea.setText(alertText.toString()));
-
-        // Update analytics
-        updateAnalytics(recentSales);
-    }
-
-    private void updateAnalytics(List<Sale> recentSales) {
-        StringBuilder analyticsText = new StringBuilder();
-        analyticsText.append("REAL-TIME ANALYTICS\n");
-        analyticsText.append("=".repeat(40)).append("\n");
-
-        // Thread status
-        analyticsText.append("Active Threads: ").append(Thread.activeCount()).append("\n");
-        analyticsText.append("Worker Threads: ").append(workerThreads.size()).append("\n\n");
-
-        // Sales analytics using parallel processing
-        if (!recentSales.isEmpty()) {
+        // Join all threads
+        for (Thread t : testThreads) {
             try {
-                CompletableFuture<Double> totalRevenue = analyzer.calculateTotalRevenue(recentSales);
-                CompletableFuture<Map<String, Double>> outletAnalysis = analyzer.analyzeSalesByOutlet(recentSales);
-
-                analyticsText.append("Recent Revenue: $").append(String.format("%.2f", totalRevenue.get())).append("\n");
-
-                Map<String, Double> outlets = outletAnalysis.get();
-                analyticsText.append("Sales by Outlet:\n");
-                outlets.forEach((outlet, revenue) ->
-                        analyticsText.append("  ").append(outlet).append(": $").append(String.format("%.2f", revenue)).append("\n"));
-
-            } catch (Exception e) {
-                analyticsText.append("Analytics processing...\n");
-            }
-        }
-
-        // Memory usage
-        Runtime runtime = Runtime.getRuntime();
-        long totalMemory = runtime.totalMemory();
-        long freeMemory = runtime.freeMemory();
-        long usedMemory = totalMemory - freeMemory;
-
-        analyticsText.append("\nMemory Usage:\n");
-        analyticsText.append("  Used: ").append(String.valueOf(usedMemory / (1024 * 1024))).append(" MB\n");
-        analyticsText.append("  Free: ").append(String.valueOf(freeMemory / (1024 * 1024))).append(" MB\n");
-        analyticsText.append("  Total: ").append(String.valueOf(totalMemory / (1024 * 1024))).append(" MB\n");
-
-        SwingUtilities.invokeLater(() -> analyticsArea.setText(analyticsText.toString()));
-    }
-
-    private void resetSystem() {
-        // Reset inventory
-        initializeInventory();
-
-        // Clear queues
-        salesQueue.clear();
-        alertQueue.clear();
-
-        System.out.println("System reset completed!");
-    }
-
-    // Thread joining demonstration
-    public void shutdown() {
-        System.out.println("\n=== SHUTTING DOWN SYSTEM ===");
-
-        // Stop all workers
-        workers.forEach(worker -> {
-            if (worker instanceof InventoryMonitor) {
-                ((InventoryMonitor) worker).stop();
-            } else if (worker instanceof SalesSimulator) {
-                ((SalesSimulator) worker).stop();
-            } else if (worker instanceof StockReplenisher) {
-                ((StockReplenisher) worker).stop();
-            }
-        });
-
-        // Stop GUI update timer with the correct Timer type
-        if (guiUpdateTimer != null) {
-            guiUpdateTimer.stop();
-        }
-
-        // Join all worker threads
-        for (Thread thread : workerThreads) {
-            try {
-                thread.join(1000); // Wait up to 1 second for each thread
+                t.join();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
 
-        // Shutdown the analyzer
-        analyzer.shutdown();
+        long threadTestTime = System.currentTimeMillis() - startTime;
+        results.append("Thread Creation/Joining Test: ").append(threadTestTime).append("ms\n");
 
-        // Close the GUI
-        if (frame != null) {
-            frame.dispose();
+        // Test 2: Parallel processing with reduction
+        startTime = System.currentTimeMillis();
+        int sum = IntStream.range(1, 1000000)
+                .parallel()
+                .reduce(0, Integer::sum);
+        long parallelReductionTime = System.currentTimeMillis() - startTime;
+        results.append("Parallel Reduction Test: ").append(parallelReductionTime).append("ms (Sum: ").append(sum).append(")\n");
+
+        // Test 3: Lock contention test
+        startTime = System.currentTimeMillis();
+        ReentrantLock testLock = new ReentrantLock();
+        CountDownLatch latch = new CountDownLatch(5);
+
+        for (int i = 0; i < 5; i++) {
+            new Thread(() -> {
+                for (int j = 0; j < 1000; j++) {
+                    testLock.lock();
+                    try {
+                        // Simulate critical section
+                        Thread.yield();
+                    } finally {
+                        testLock.unlock();
+                    }
+                }
+                latch.countDown();
+            }).start();
         }
 
-        System.out.println("System shutdown completed!");
-    }
-
-    // Getters for testing
-    public ConcurrentHashMap<String, FoodItem> getInventory() {
-        return inventory;
-    }
-
-    public CafeteriaLock getLock() {
-        return mainLock;
-    }
-}
-
-public class CafeteriaDashboard {
-    public static void main(String[] args) {
         try {
-            // Set look and feel
-            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-        } catch (Exception e) {
-            e.printStackTrace();
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
 
-        // Start the management system
-        CafeteriaManagementSystem system = new CafeteriaManagementSystem();
+        long lockTestTime = System.currentTimeMillis() - startTime;
+        results.append("Lock Contention Test: ").append(lockTestTime).append("ms\n");
 
-        // Add shutdown hook
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\nShutdown hook activated...");
-            system.shutdown();
-        }));
+        return results.toString();
+    }
+
+    @Override  // Add this annotation
+    public void updateUI() {  // Make this public
+        super.updateUI();  // Add super call
+        if (systemStatusLabel != null) {  // Check for null since this might be called during initialization
+            // Update system status
+            systemStatusLabel.setText("System Status: " +
+                    (cafeteriaSystem.isSystemRunning() ? "Running" : "Stopped"));
+
+            // Update worker status with real-time info
+            workerListModel.clear();
+            for (KitchenWorker worker : cafeteriaSystem.getKitchenStaff().getWorkers()) {
+                StringBuilder status = new StringBuilder();
+                status.append(String.format("Worker %d: %s",
+                    worker.getWorkerId(),
+                    worker.isBusy() ? "🔴 BUSY" : "🟢 AVAILABLE"));
+
+                Order currentOrder = worker.getCurrentOrder();
+                if (currentOrder != null) {
+                    status.append(String.format(" | Order #%d: %s for %s",
+                        currentOrder.getId(),
+                        currentOrder.getItemName(),
+                        currentOrder.getCustomerName()));
+                }
+
+                status.append(String.format(" | Status: %s", worker.getCurrentTask()));
+
+                workerListModel.addElement(status.toString());
+            }
+
+            // Update pending orders in real-time
+            pendingOrdersModel.clear();
+            List<Order> pendingOrders = cafeteriaSystem.getOrderQueue().getPendingOrders();
+            for (Order order : pendingOrders) {
+                pendingOrdersModel.addElement(order);
+            }
+
+            // Update completed orders with synchronized access
+            List<Order> completed = cafeteriaSystem.getOrderQueue().getCompletedOrders();
+            completedOrdersModel.clear();
+            for (Order order : completed) {
+                completedOrdersModel.addElement(order);
+            }
+
+            // Update inventory status in real-time
+            Map<String, Integer> inventory = cafeteriaSystem.getInventoryManager().getInventorySnapshot();
+            StringBuilder inventoryText = new StringBuilder();
+            for (Map.Entry<String, Integer> entry : inventory.entrySet()) {
+                inventoryText.append(entry.getKey())
+                           .append(": ")
+                           .append(entry.getValue())
+                           .append("\n");
+            }
+            inventoryArea.setText(inventoryText.toString());
+
+            // Update metrics
+            MetricsCollector metrics = cafeteriaSystem.getMetricsCollector();
+            String metricsText = String.format(
+                    "<html>Total Orders: %d<br/>" +
+                    "Completed: %d<br/>" +
+                    "Pending: %d<br/>" +
+                    "Avg Processing Time: %.1fms<br/>" +
+                    "Throughput: %.2f orders/min</html>",
+                    metrics.getTotalOrders(),
+                    metrics.getCompletedOrders(),
+                    metrics.getTotalOrders() - metrics.getCompletedOrders(), // Pending is total minus completed
+                    metrics.getAverageProcessingTime(),
+                    metrics.getThroughput()
+            );
+            metricsLabel.setText(metricsText);
+        }
     }
 }
