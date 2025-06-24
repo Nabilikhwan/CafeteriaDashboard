@@ -270,7 +270,8 @@ class KitchenWorker implements Runnable {
     private void processOrder(Order order) {
         busy = true;
         try {
-            currentTask = "Starting preparation of " + order.getItemName() + " (Order #" + order.getId() + ")";
+            currentTask = "Starting preparation of " + order.getItemName() +
+                          " (Order #" + order.getId() + ", Complexity: " + order.getComplexity() + ")"; // Use getComplexity
 
             // Process based on item type
             switch (order.getItemName()) {
@@ -293,7 +294,8 @@ class KitchenWorker implements Runnable {
 
             // Complete the order and ensure it's visible in completed list
             orderQueue.completeOrder(order);
-            currentTask = "Completed Order #" + order.getId() + " - " + order.getItemName();
+            currentTask = "Completed Order #" + order.getId() + " - " + order.getItemName() +
+                          " (Complexity: " + order.getComplexity() + ")"; // Use getComplexity
             Thread.sleep(1000);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -445,9 +447,15 @@ class Order {
     private final String itemName;
     private long orderTime;
     private long completionTime;
+    private final int complexity; // Added field
 
-    public Order(String itemName, int cookingTime, int complexity) {
+    public Order(String itemName, int complexity) {
         this.itemName = itemName;
+        this.complexity = complexity; // Store complexity
+    }
+
+    public int getComplexity() { // Added getter
+        return complexity;
     }
 
     // Remove unused getters
@@ -645,15 +653,13 @@ class DashboardUI extends JPanel {
         }
 
         // Remove customer selection since we don't need it anymore
-        int cookingTime = 0;
-        int complexity = 0;
+        int complexity = 0; // Keep complexity
         boolean orderPlaced = false;
 
         // First check and consume ingredients
         switch (selectedItem) {
             case "Chicken Burger":
                 if (cafeteriaSystem.processOrderIngredients("Chicken Burger")) {
-                    cookingTime = 4000;
                     complexity = 3;
                     orderPlaced = true;
                 } else {
@@ -662,7 +668,6 @@ class DashboardUI extends JPanel {
                 break;
             case "Pizza":
                 if (cafeteriaSystem.processOrderIngredients("Pizza")) {
-                    cookingTime = 5000;
                     complexity = 4;
                     orderPlaced = true;
                 } else {
@@ -671,7 +676,6 @@ class DashboardUI extends JPanel {
                 break;
             case "Pasta":                // Changed from Pasta Dish
                 if (cafeteriaSystem.processOrderIngredients("Pasta")) {
-                    cookingTime = 3000;
                     complexity = 2;
                     orderPlaced = true;
                 } else {
@@ -680,7 +684,6 @@ class DashboardUI extends JPanel {
                 break;
             case "Salad Mix":            // Changed from Fresh Salad
                 if (cafeteriaSystem.processOrderIngredients("Salad Mix")) {
-                    cookingTime = 2000;
                     complexity = 1;
                     orderPlaced = true;
                 } else {
@@ -692,7 +695,7 @@ class DashboardUI extends JPanel {
         }
 
         if (orderPlaced) {
-            Order order = new Order(selectedItem, cookingTime, complexity);  // Empty string for customer
+            Order order = new Order(selectedItem, complexity); // Pass complexity
             cafeteriaSystem.getOrderQueue().addOrder(order);
             cafeteriaSystem.getMetricsCollector().recordNewOrder(); // This increments total orders
 
@@ -837,7 +840,7 @@ class DashboardUI extends JPanel {
         return results.toString();
     }
 
-    @Override  // Add this annotation
+    @Override  // Modify the updateUI method
     public void updateUI() {
         super.updateUI();
         if (systemStatusLabel != null) {
@@ -895,14 +898,10 @@ class DashboardUI extends JPanel {
             String metricsText = String.format(
                     "<html>Total Orders: %d<br/>" +
                     "Completed: %d<br/>" +
-                    "Pending: %d<br/>" +
-                    "Avg Processing Time: %.1fms<br/>" +
-                    "Throughput: %.2f orders/min</html>",
+                    "Pending: %d</html>", // Removed Avg Processing Time and Throughput
                     metrics.getTotalOrders(),
                     metrics.getCompletedOrders(),
-                    metrics.getTotalOrders() - metrics.getCompletedOrders(), // Pending is total minus completed
-                    metrics.getAverageProcessingTime(),
-                    metrics.getThroughput()
+                    metrics.getTotalOrders() - metrics.getCompletedOrders() // Pending is total minus completed
             );
             metricsLabel.setText(metricsText);
         }
